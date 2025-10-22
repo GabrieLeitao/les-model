@@ -1,0 +1,70 @@
+# Build directories
+/build/
+/build-*/
+/cmake-build-*/
+
+# CMake files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CMakeLists.txt.user
+Makefile
+compile_commands.json
+
+# Object files, libraries, executables
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# IDEs and editors
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-*
+*.project
+*.cproject
+
+# macOS / Windows junk
+.DS_Store
+Thumbs.db
+
+# Swap / temp files
+*~
+*.swp
+*.swo
+*.tmp
+*.cache
+
+# Logs, core dumps, profiling
+*.log
+core
+*.core
+*.gcda
+*.gcno
+*.prof
+*.ipch
+
+# Generated archives / packages
+dist/
+bin/
+lib/
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Output data (VTK files)
+output/
+/sim-*/
+
+# Misc
+.env
+*.keystore
