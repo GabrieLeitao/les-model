@@ -14,6 +14,9 @@ struct Field
     std::vector<double> u_new, v_new, w_new; // provisional velocities
 
     std::vector<double> p;             // pressure
+    std::vector<double> p_rhs;             // RHS: divergence u * rho/dt
+
+
     std::vector<double> nu_t;          // <-- eddy viscosity (LES)
     
     std::vector<bool> is_solid;          // Obstacle mask
@@ -27,6 +30,7 @@ struct Field
             v_new(nx_ * ny_ * nz_, 0.0),
             w_new(nx_ * ny_ * nz_, 0.0),
             p(nx_ * ny_ * nz_, 0.0),
+            p_rhs(nx_ * ny_ * nz_, 0.0),
             nu_t(nx_ * ny_ * nz_, 0.0),
             is_solid(nx_ * ny_ * nz_, false)
     {}

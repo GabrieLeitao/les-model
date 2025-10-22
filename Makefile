@@ -1,6 +1,6 @@
 # Compiler
 CXX = g++
-CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -pedantic -fopenmpgit
+CXXFLAGS = -std=c++17 -O2 -Wall -g -Wextra -pedantic -fopenmp
 
 # Directories
 SRC_DIR = src

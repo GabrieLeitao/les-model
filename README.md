@@ -39,3 +39,8 @@ Project layout
 Makefile
 - Uses `g++ -std=c++17 -fopenmp` (see `Makefile` for flags)
 - To change compiler flags edit `Makefile` variable `CXXFLAGS`.
+
+TODO
+- Implement PCG with better Preconditioner
+- Implement SOTA multigrid solver for Pressure
+- Semi-implicit methods for momentum: Convection Explicitly, Diffusion Implicitly

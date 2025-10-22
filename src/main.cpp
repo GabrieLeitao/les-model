@@ -10,6 +10,7 @@
 #include <sstream>
 
 #include "field.h"
+#include "pressure.h"
 #include "io_vtk.h"
 
 // --- Function declarations (prototypes) ---
@@ -22,8 +23,6 @@ void compute_sgs_stress(struct Field& f, struct Stress& sgs, const struct Mesh& 
 void apply_nut_BCs(Field& f, const Mesh& m);
 void solve_momentum(struct Field &f, const struct Mesh &m, double dt, double nu);
 
-void solve_pressure(struct Field &f, const struct Mesh &m, double dt, double rho);
-void solve_pressure_GS(struct Field &f, const struct Mesh &m, double dt, double rho, int maxIter);
 void apply_pressure_BCs(Field& f, const Mesh& m);
 
 void correct_velocity(struct Field &f, const struct Mesh &m, double dt, double rho);
@@ -38,7 +37,12 @@ int main()
 {
     Mesh  mesh{ 100, 100, 100, 0.01, 0.01, 0.01 };
     Field field(mesh.nx, mesh.ny, mesh.nz);
-    Stress sgs(mesh.nx * mesh.ny * mesh.nz);
+    int n_nodes = mesh.nx * mesh.ny * mesh.nz;
+    Stress sgs(n_nodes);
+    // Pressure stencil matrix
+    StencilMatrix A(n_nodes);
+    build_stencil(A, field, mesh);
+
     define_obstacle_mask(field, mesh);
 
     double rho    = 1.2;
@@ -88,8 +92,9 @@ int main()
         solve_momentum(field, mesh, dt, nu);  
         apply_velocity_BCs(field, mesh);
         auto t3 = std::chrono::high_resolution_clock::now();
-        // solve_pressure(field, mesh, dt, rho);
+        // solve_pressure_jacobi(field, mesh, dt, rho);
         solve_pressure_GS(field, mesh, dt, rho, 100);
+        // solve_pressure_pcg(field, mesh, A, dt, rho, 1000);
         auto t4 = std::chrono::high_resolution_clock::now();
         correct_velocity(field, mesh, dt, rho);
         auto t5 = std::chrono::high_resolution_clock::now();
@@ -129,8 +134,8 @@ int main()
     
     double sec = total_elapsed.count();
     int h = static_cast<int>(sec / 3600);
-    int m = static_cast<int>((sec % 3600) / 60);
-    int s = static_cast<int>(sec % 60);
+    int m = static_cast<int>(std::fmod(sec, 3600) / 60);
+    int s = static_cast<int>(std::fmod(sec, 60));
 
     std::cout << "Total simulation time: ";
     if (h > 0)
@@ -588,246 +593,6 @@ void solve_momentum(Field &f, const Mesh &m, double dt, double nu = 1e-5)
     f.u.swap(f.u_new);
     f.v.swap(f.v_new);
     f.w.swap(f.w_new);
-}
-
-/**
- * solve_pressure - solve pressure Poisson equation (Jacobi) to reduce velocity divergence.
- * @param f  Field&   : in/out; reads provisional velocities (f.u,f.v,f.w) and pressure f.p, updates f.p.
- * @param m  Mesh const& : grid spacings/sizes for Laplacian and divergence operators.
- * @param dt double   : time step used to scale RHS (rho/dt factor).
- * @param rho double  : fluid density used in RHS scaling.
- * Operations:
- *  - compute divergence of provisional velocity field
- *  - perform a fixed number of Jacobi iterations to update pressure
- *  - swap updated pressure into f.p and enforce Neumann (zero-normal-gradient) boundary conditions
- */
-void solve_pressure(Field &f, const Mesh &m, double dt, double rho)
-{
-    int nx = m.nx, ny = m.ny, nz = m.nz;
-    auto idx = [&](int i,int j,int k){ return f.idx(i,j,k); };
-
-    std::vector<double> p_new(f.p.size());
-    std::vector<double> rhs(f.p.size());
-
-    double coef = rho / dt;
-    double dx2 = m.dx*m.dx, dy2 = m.dy*m.dy, dz2 = m.dz*m.dz;
-    double denom = 2*(1.0/dx2 + 1.0/dy2 + 1.0/dz2);
-
-    // Precompute RHS (divergence of provisional velocity)
-    #pragma omp parallel for
-    for (int i = 1; i < nx-1; ++i)
-    for (int j = 1; j < ny-1; ++j)
-    for (int k = 1; k < nz-1; ++k)
-    {
-        int id = idx(i,j,k);
-        // divergence of provisional velocity u*
-        double div = (f.u[idx(i+1,j,k)] - f.u[idx(i-1,j,k)]) / (2*m.dx)
-                   + (f.v[idx(i,j+1,k)] - f.v[idx(i,j-1,k)]) / (2*m.dy)
-                   + (f.w[idx(i,j,k+1)] - f.w[idx(i,j,k-1)]) / (2*m.dz);
-        
-        // RHS of Poisson equation
-        rhs[id] = coef * div;
-    }
-
-    for (int iter = 0; iter < 100; ++iter)
-    {
-        double maxResidual = 0.0;
-
-        #pragma omp parallel for reduction(max:maxResidual)
-        for (int i = 1; i < nx-1; ++i)
-        for (int j = 1; j < ny-1; ++j)
-        for (int k = 1; k < nz-1; ++k)
-        {
-            int id = idx(i,j,k);
-            double p_old = f.p[id];
-
-            // Jacobi update
-            p_new[id] = (
-                (f.p[idx(i+1,j,k)] + f.p[idx(i-1,j,k)]) / dx2 +
-                (f.p[idx(i,j+1,k)] + f.p[idx(i,j-1,k)]) / dy2 +
-                (f.p[idx(i,j,k+1)] + f.p[idx(i,j,k-1)]) / dz2 -
-                rhs[id]
-            ) / denom;
-
-            // compute residual
-            double res = std::abs(p_new[id] - p_old);
-            if(res > maxResidual) maxResidual = res;
-        }
-        // std::cout << "Iteration " << iter << ", max residual = " << maxResidual << "\n";
-
-        f.p.swap(p_new);
-
-        apply_pressure_BCs(f, m);
-    
-        // check convergence
-        if(maxResidual < 1e-6)
-        {
-            // std::cout << "Pressure converged in " << iter+1 << " iterations, residual = "
-            //             << maxResidual << "\n";
-            break;
-        }
-    }
-}
-
-/**
- * solve_pressure - solve pressure Poisson equation using Gauss-Seidel iteration to reduce velocity divergence.
- * @param f  Field&   : in/out; reads provisional velocities (f.u,f.v,f.w) and pressure f.p, updates f.p.
- * @param m  Mesh const& : grid spacings/sizes for Laplacian and divergence operators.
- * @param dt double   : time step used to scale RHS (rho/dt factor).
- * @param rho double  : fluid density used in RHS scaling.
- * @param maxIter int : maximum number of Gauss-Seidel iterations.
- * Operations:
- *  - compute divergence of provisional velocity field
- *  - perform Gauss-Seidel iterations to update pressure
- *  - enforce Neumann (zero-normal-gradient) boundary conditions
- */
-void solve_pressure_GS(Field &f, const Mesh &m, double dt, double rho, int maxIter=200)
-{
-    int nx = m.nx, ny = m.ny, nz = m.nz;
-    auto idx = [&](int i,int j,int k){ return f.idx(i,j,k); };
-
-    std::vector<double> rhs(f.p.size());
-
-    double dx2 = m.dx*m.dx, dy2 = m.dy*m.dy, dz2 = m.dz*m.dz;
-    double coef = 1.0 / (2.0*(1.0/dx2 + 1.0/dy2 + 1.0/dz2));
-    double omega = 1.7; // relaxation factor
-
-    #pragma omp parallel for
-    for (int i = 1; i < nx-1; ++i)
-    for (int j = 1; j < ny-1; ++j)
-    for (int k = 1; k < nz-1; ++k)
-    {
-        int id = idx(i,j,k);
-        // divergence of provisional velocity u*
-        double div = (f.u[idx(i+1,j,k)] - f.u[idx(i-1,j,k)]) / (2*m.dx)
-                   + (f.v[idx(i,j+1,k)] - f.v[idx(i,j-1,k)]) / (2*m.dy)
-                   + (f.w[idx(i,j,k+1)] - f.w[idx(i,j,k-1)]) / (2*m.dz);
-        
-        // RHS of Poisson equation
-        rhs[id] = rho/dt * div;
-    }
-
-    for(int iter = 0; iter < maxIter; ++iter)
-    {
-        double maxResidual = 0.0;
-
-        for(int i = 1; i < nx-1; ++i)
-        for(int j = 1; j < ny-1; ++j)
-        for(int k = 1; k < nz-1; ++k)
-        {
-            int id = idx(i,j,k);
-            // old pressure for residual computation
-            double p_old = f.p[id];
-
-            f.p[id] = (1-omega)*f.p[id] + omega * coef * (
-                (f.p[idx(i+1,j,k)] + f.p[idx(i-1,j,k)])/dx2 +
-                (f.p[idx(i,j+1,k)] + f.p[idx(i,j-1,k)])/dy2 +
-                (f.p[idx(i,j,k+1)] + f.p[idx(i,j,k-1)])/dz2 -
-                rhs[id]
-            ); // SOR update
-
-            // compute residual
-            double res = std::abs(f.p[id] - p_old);
-            if(res > maxResidual) maxResidual = res;
-        }
-        // std::cout << "Iteration " << iter << ", max residual = " << maxResidual << "\n";
-
-        apply_pressure_BCs(f, m);
-
-        // check convergence
-        if(maxResidual < 1e-6)
-        {
-            std::cout << "Pressure converged in " << iter+1 << " iterations, residual = "
-                      << maxResidual << "\n";
-            break;
-        }
-    }
-}
-
-
-/**
- * apply_pressure_BCs - apply boundary conditions to pressure field.
- * @param f  Field&   : in/out; pressure field f.p
- * @param nx int      : number of grid points in x direction
- * @param ny int      : number of grid points in y direction
- * @param nz int      : number of grid points in z direction
- * Operations:
- *  - Enforce zero-Neumann (zero normal gradient) on Y and Z walls
- *  - Enforce zero-Neumann at inlet (x=0)
- *  - Enforce Dirichlet (p=0) at outlet (x=nx-1) for stability
- */
-void apply_pressure_BCs(Field &f, const Mesh &m)
-{
-    int nx = m.nx, ny = m.ny, nz = m.nz;
-    const int stride_i = ny * nz;
-    const int stride_j = nz;
-
-    // --- 1. Outer Boundaries ---
-
-    // Inlet (X=0) - Neumann
-    #pragma omp parallel for
-    for (int j = 0; j < ny; ++j) {
-        const int j_base = j * stride_j;
-        for (int k = 0; k < nz; ++k) {
-            const int id_0 = j_base + k;       // i=0
-            const int id_1 = id_0 + stride_i;  // i=1
-            f.p[id_0] = f.p[id_1];
-        }
-    }
-
-    // Outlet (X=nx-1) - Dirichlet
-    #pragma omp parallel for
-    for (int j = 0; j < ny; ++j) {
-        const int j_base = (nx - 1) * stride_i + j * stride_j;
-        for (int k = 0; k < nz; ++k) {
-            f.p[j_base + k] = 0.0;
-        }
-    }
-
-    // Y-Walls (j=0, j=ny-1) - Neumann
-    #pragma omp parallel for
-    for (int i = 0; i < nx; ++i) {
-        const int i_base = i * stride_i;
-        const int ij_base_bot = i_base;                      // j=0
-        const int ij_base_top = i_base + (ny - 1) * stride_j;
-        const int ij_base_bot_neighbor = i_base + stride_j;  // j=1
-        const int ij_base_top_neighbor = i_base + (ny - 2) * stride_j;
-
-        for (int k = 0; k < nz; ++k) {
-            f.p[ij_base_bot + k] = f.p[ij_base_bot_neighbor + k];
-            f.p[ij_base_top + k] = f.p[ij_base_top_neighbor + k];
-        }
-    }
-
-    // Z-Walls (k=0, k=nz-1) - Neumann
-    #pragma omp parallel for
-    for (int i = 0; i < nx; ++i) {
-        const int i_base = i * stride_i;
-        for (int j = 0; j < ny; ++j) {
-            const int ij_base = i_base + j * stride_j;
-            const int id_0 = ij_base;      // k=0
-            const int id_1 = ij_base + 1;  // k=1
-            const int id_N   = ij_base + (nz - 1);
-            const int id_Nm1 = ij_base + (nz - 2);
-            f.p[id_0] = f.p[id_1];
-            f.p[id_N] = f.p[id_Nm1];
-        }
-    }
-
-    // --- 2. Inner Obstacle ---
-    #pragma omp parallel for
-    for (int i = 1; i < nx - 1; ++i) {
-        const int i_base = i * stride_i;
-        for (int j = 1; j < ny - 1; ++j) {
-            const int j_base = i_base + j * stride_j;
-            for (int k = 1; k < nz - 1; ++k) {
-                const int id = j_base + k;
-                if (f.is_solid[id]) {
-                    f.p[id] = f.p[id + stride_i]; // Neumann (e.g., copy from i+1)
-                }
-            }
-        }
-    }
 }
 
 /**
