@@ -14,13 +14,15 @@ struct Field
     std::vector<double> u_new, v_new, w_new; // provisional velocities
 
     std::vector<double> p;             // pressure
-    std::vector<double> p_rhs;             // RHS: divergence u * rho/dt
+    std::vector<double> p_rhs;             // storde RHS: divergence u * rho/dt
 
 
     std::vector<double> nu_t;          // <-- eddy viscosity (LES)
     
     std::vector<bool> is_solid;          // Obstacle mask
 
+    Field() : nx(0), ny(0), nz(0) {}
+    
     Field(int nx_, int ny_, int nz_)
         : nx(nx_), ny(ny_), nz(nz_),
             u(nx_ * ny_ * nz_, 0.0),

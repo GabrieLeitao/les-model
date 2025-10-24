@@ -62,6 +62,7 @@ lib/
 
 # Output data (VTK files)
 output/
+checkpoint/
 /sim-*/
 
 # Misc

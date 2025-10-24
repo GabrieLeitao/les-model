@@ -5,16 +5,18 @@
 #include <iomanip>
 #include <chrono>
 #include <algorithm>
-#include <omp.h>
 #include <string>
 #include <sstream>
+#include <csignal>
+
+#include <omp.h>
 
 #include "field.h"
 #include "pressure.h"
-#include "io_vtk.h"
+#include "io.h"
+#include "statistics.h"
 
 // --- Function declarations (prototypes) ---
-void apply_velocity_BCs(Field& f, const Mesh &m);
 double compute_adaptive_dt(const Field& field, const Mesh& mesh, double nu);
 
 void define_obstacle_mask(Field &f, const Mesh &m);
@@ -22,26 +24,59 @@ void define_obstacle_mask(Field &f, const Mesh &m);
 void compute_sgs_stress(struct Field& f, struct Stress& sgs, const struct Mesh& m);
 void apply_nut_BCs(Field& f, const Mesh& m);
 void solve_momentum(struct Field &f, const struct Mesh &m, double dt, double nu);
-
-void apply_pressure_BCs(Field& f, const Mesh& m);
+void apply_velocity_BCs(Field& f, const Mesh &m);
 
 void correct_velocity(struct Field &f, const struct Mesh &m, double dt, double rho);
 
 char get_start_choice(void);
 int try_continue(Field &field, const Mesh &mesh, double &time_simulated, double dt);
 
+// Global flag for graceful termination
+volatile bool g_stop_requested = false;
+
+void signal_handler(int signum)
+{
+    if (signum == SIGINT) {
+        std::cout << "\nStop request received (SIGINT). Will save and exit soon...\n";
+        g_stop_requested = true;
+    }
+}
+
 /**
  * main - Main code flow of the solver.
  */
 int main()
 {
-    Mesh  mesh{ 100, 100, 100, 0.01, 0.01, 0.01 };
+    // Register signal handler for graceful termination
+    signal(SIGINT, signal_handler);
+
+    const int size = 50;
+    const double spacing = 0.01;
+    Mesh  mesh{ size, size, size, spacing, spacing, spacing };
     Field field(mesh.nx, mesh.ny, mesh.nz);
     int n_nodes = mesh.nx * mesh.ny * mesh.nz;
     Stress sgs(n_nodes);
+
+    Statistics stats;
+    int stats_start_step = 1000;
+    init_statistics(stats, mesh, stats_start_step);
+
     // Pressure stencil matrix
     StencilMatrix A(n_nodes);
     build_stencil(A, field, mesh);
+    
+    // IC preconditioner matrix
+    StencilMatrix L(n_nodes);
+
+    build_ic_preconditioner(L, A, field, mesh);
+    // Chebyshev preconditioner parameters
+    std::cout << "Estimating eigenvalues..." << std::endl;
+    const double lambda_max = estimate_lambda_max(A, field, 20);
+    // For a 1x1x1 cube with Dirichlet BCs, lambda_min = 3*pi^2
+    // Your inlet is Neumann, but this is a robust physical estimate.
+    const double lambda_min = 3.0 * M_PI * M_PI; 
+    std::cout << "Eigenvalue estimates: min=" << lambda_min 
+              << ", max=" << lambda_max << std::endl;
 
     define_obstacle_mask(field, mesh);
 
@@ -52,20 +87,18 @@ int main()
     int    nSteps = 2000;
     double time_simulated = 0.0;
 
+
     // ask user and act accordingly
     int startStep = 0;
     char choice = get_start_choice();
-    if (choice == 'c')
-    {
-        startStep = try_continue(field, mesh, time_simulated, dt);
+    if (choice == 'c') {
+        startStep = load_state(field, mesh, time_simulated, dt);
         if (startStep == 0)
         {
             std::cout << "Continuing failed or no file found — restarting from scratch.\n";
             apply_velocity_BCs(field, mesh);
         }
-    }
-    else
-    {
+    } else {
         apply_velocity_BCs(field, mesh);
     }
 
@@ -74,12 +107,14 @@ int main()
     // start loop from startStep so we continue rather than restart
     for (int step = startStep; step < nSteps; ++step)
     {
-        if (step <= 20)
-        {
-            dt = 1e-3; 
+        if (g_stop_requested) {
+            std::cout << "Graceful stop requested. Saving state at step " << step << "...\n";
+            save_state(field, mesh, time_simulated, dt, step); 
+            break;
         }
-        else
-        {
+        if (step <= 20) {
+            dt = 1e-3; 
+        } else {
             dt = compute_adaptive_dt(field, mesh, nu);
         }
         // std::cout << "Step " << step << ", dt = " << dt << "\n";
@@ -92,9 +127,16 @@ int main()
         solve_momentum(field, mesh, dt, nu);  
         apply_velocity_BCs(field, mesh);
         auto t3 = std::chrono::high_resolution_clock::now();
+
+        // Pressure solve
         // solve_pressure_jacobi(field, mesh, dt, rho);
         solve_pressure_GS(field, mesh, dt, rho, 100);
-        // solve_pressure_pcg(field, mesh, A, dt, rho, 1000);
+        // calculate_divergence(field.p_rhs, field, mesh, dt, rho);
+        // Vector b(n_nodes);
+        // build_b_vector(b, field.p_rhs, field, mesh);
+        // solve_pressure_pcg(A, b, field.p, field, 1000, 1e-6);
+        // solve_pressure_pcg_chebyshev(A, b, field.p, field, lambda_min, lambda_max, 5, 1000, 1e-6);
+
         auto t4 = std::chrono::high_resolution_clock::now();
         correct_velocity(field, mesh, dt, rho);
         auto t5 = std::chrono::high_resolution_clock::now();
@@ -106,18 +148,11 @@ int main()
         std::chrono::duration<double> dt_pressure = t4 - t3;
         std::chrono::duration<double> dt_correct  = t5 - t4;
 
+        // Update statistics after velocity correction
+        update_statistics(stats, field, step);
+
         if(step % 100 == 0)
         {
-            // #pragma omp parallel for
-            // for(int i=0;i<mesh.nx*mesh.ny*mesh.nz;++i)
-            // {
-            //     if(std::isnan(field.u[i]) || std::isnan(field.v[i]) || std::isnan(field.w[i]) ||
-            //     std::isnan(field.p[i]))
-            //     {
-            //         std::cerr << "NaN detected at index " << i << "\n";
-            //         exit(1);
-            //     }
-            // }
             std::cout << "Step " << step << " times (s): "
                       << "SGS=" << dt_sgs.count()
                       << ", Momentum=" << dt_momentum.count()
@@ -131,6 +166,12 @@ int main()
 
     auto total_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> total_elapsed = total_end - total_start;
+
+    if (!g_stop_requested) {
+        std::cout << "Simulation finished naturally.\n";
+        save_state(field, mesh, time_simulated, dt, nSteps);
+    }
+
     
     double sec = total_elapsed.count();
     int h = static_cast<int>(sec / 3600);
@@ -145,6 +186,8 @@ int main()
     std::cout << s << " s\n";
 
     std::cout << "Total simulated physical time: " << time_simulated << " s\n";
+
+    finalize_and_save(stats, mesh, "output/statistics_final.vtk");
 
     return 0;
 }
@@ -222,7 +265,7 @@ void define_obstacle_mask(Field &f, const Mesh &m)
     int j_min_box = ny * 2 / 5;
     int j_max_box = ny * 3 / 5;
     int k_min_box = nz * 2 / 5;
-    int k_max_box = nz * 4 / 5;
+    int k_max_box = nz * 3 / 5;
 
     #pragma omp parallel for
     for (int i = 0; i < nx; ++i) {
@@ -244,9 +287,6 @@ void define_obstacle_mask(Field &f, const Mesh &m)
     }
 }
 
-
-
-
 /**
  * appy_no_slip_BCs - Enforce no-slip boundary conditions on walls.
  * @param f  Field&   : in/out; velocity fields f.u, f.v, f.w
@@ -258,7 +298,6 @@ void define_obstacle_mask(Field &f, const Mesh &m)
 void apply_velocity_BCs(Field &f, const Mesh &m)
 {
     int nx = m.nx, ny = m.ny, nz = m.nz;
-    // auto idx = ...; // Não precisamos mais da lambda
 
     // --- OTIMIZAÇÃO: Pré-calcular strides (passos) ---
     const int stride_i = ny * nz; // O "passo" para i+1
@@ -328,9 +367,8 @@ void apply_velocity_BCs(Field &f, const Mesh &m)
     }
 
     // --- 2. Obstáculo Interior (SOBRESCREVE) ---
-    // (Este é o loop 3D, beneficia o máximo)
     #pragma omp parallel for
-    for (int i = 1; i < nx - 1; ++i) { // Apenas interior
+    for (int i = 1; i < nx - 1; ++i) {
         const int i_base = i * stride_i;
         for (int j = 1; j < ny - 1; ++j) {
             const int j_base = i_base + j * stride_j;

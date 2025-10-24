@@ -40,7 +40,13 @@ Makefile
 - Uses `g++ -std=c++17 -fopenmp` (see `Makefile` for flags)
 - To change compiler flags edit `Makefile` variable `CXXFLAGS`.
 
+DONE:
+- Implemented graceful shutdown
+- Implemented correct checkpoint saving all Field with precision
+- Implemented IC(0) preconditioner for PCG for pressure laplacian solver
+- Implemented Chebyshev preconditioner for PCG for pressure laplacian solver
+- Implemented statistic for time-average flow after nsteps
+
 TODO
-- Implement PCG with better Preconditioner
 - Implement SOTA multigrid solver for Pressure
 - Semi-implicit methods for momentum: Convection Explicitly, Diffusion Implicitly

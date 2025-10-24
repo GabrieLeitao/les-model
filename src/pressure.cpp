@@ -78,7 +78,14 @@ void apply_pressure_BCs(Field &f, const Mesh &m)
             for (int k = 1; k < nz - 1; ++k) {
                 const int id = j_base + k;
                 if (f.is_solid[id]) {
-                    f.p[id] = f.p[id + stride_i]; // Neumann (e.g., copy from i+1)
+                    // Find the *first available* fluid neighbor and copy its pressure
+                    if      (i < nx - 1 && !f.is_solid[id + stride_i]) { f.p[id] = f.p[id + stride_i]; }
+                    else if (i > 0      && !f.is_solid[id - stride_i]) { f.p[id] = f.p[id - stride_i]; }
+                    else if (j < ny - 1 && !f.is_solid[id + stride_j]) { f.p[id] = f.p[id + stride_j]; }
+                    else if (j > 0      && !f.is_solid[id - stride_j]) { f.p[id] = f.p[id - stride_j]; }
+                    else if (k < nz - 1 && !f.is_solid[id + 1])        { f.p[id] = f.p[id + 1];        }
+                    else if (k > 0      && !f.is_solid[id - 1])        { f.p[id] = f.p[id - 1];        }
+                    // If it's fully enclosed by solid, its pressure doesn't matter
                 }
             }
         }
@@ -176,7 +183,7 @@ void solve_pressure_jacobi(Field &f, const Mesh &m, double dt, double rho)
  *  - perform Gauss-Seidel iterations to update pressure
  *  - enforce Neumann (zero-normal-gradient) boundary conditions
  */
-void solve_pressure_GS(Field &f, const Mesh &m, double dt, double rho, int maxIter=200)
+void solve_pressure_GS(Field &f, const Mesh &m, double dt, double rho, int maxIter)
 {
     int nx = m.nx, ny = m.ny, nz = m.nz;
     auto idx = [&](int i,int j,int k){ return f.idx(i,j,k); };
@@ -322,23 +329,6 @@ void calculate_divergence(Vector& rhs, const Field& f, const Mesh& m,
 }
 
 /**
- * solve_pressure_pcg - solve pressure Poisson equation using Preconditioned Conjugate Gradient.
- */
-void solve_pressure_pcg(Field &f, const Mesh &m, StencilMatrix &A, double dt, 
-                        double rho, int maxIter, double tol)
-{
-    const int n_nodes = m.nx * m.ny * m.nz;
-    
-    calculate_divergence(f.p_rhs, f, m, dt, rho);
-
-    Vector b(n_nodes);
-    build_b_vector(b, f.p_rhs, f, m);
-
-    // 2. Solve the pressure equation: A*p = b
-    solve_pcg(A, b, f.p, f, maxIter, tol);
-}
-
-/**
  * @brief Solves the linear system A*x = b using PCG with Jacobi preconditioner.
  *
  * @param A       The pre-built StencilMatrix
@@ -349,7 +339,7 @@ void solve_pressure_pcg(Field &f, const Mesh &m, StencilMatrix &A, double dt,
  * @param tol     Convergence tolerance
  * @return int    Number of iterations performed
  */
-int solve_pcg(const StencilMatrix& A, const Vector& b, Vector& x,
+int solve_pressure_pcg(const StencilMatrix& A, const Vector& b, Vector& x,
               const Field& field, int max_iter, double tol)
 {
     const int n_nodes = field.nx * field.ny * field.nz;
@@ -370,6 +360,7 @@ int solve_pcg(const StencilMatrix& A, const Vector& b, Vector& x,
 
     // z = M_inv * r (Jacobi preconditioner, where M is diag(A))
     apply_jacobi_preconditioner(p, r, A);
+    // apply_ic_preconditioner(p, r, A, field);
 
     // p = z
     // parallel_copy(p, z);
@@ -402,6 +393,7 @@ int solve_pcg(const StencilMatrix& A, const Vector& b, Vector& x,
 
         // z = M_inv * r
         apply_jacobi_preconditioner(z, r, A);
+        // apply_ic_preconditioner(z, r, A, field);
 
         // rho_new = r . z
         double rho_new = parallel_dot(r, z);
@@ -433,6 +425,134 @@ void apply_jacobi_preconditioner(Vector& z, const Vector& r,
         // A.A_c[i] is 1.0 for solid/Dirichlet cells, so no divide-by-zero
         z[i] = r[i] / A.A_c[i];
     }
+}
+
+/**
+ * @brief (RUN IN PCG LOOP) Applies the IC(0) preconditioner.
+ *
+ * Solves M*z = r, where M = L*L^T. This is done in two serial steps:
+ * 1. Forward-substitution:  Solves L*y = r  (result stored in z)
+ * 2. Back-substitution:   Solves L^T*z = y (result stored in z)
+ *
+ * @param z       Output: The preconditioned vector.
+ * @param r       Input: The residual vector.
+ * @param L       Input: The pre-computed L matrix.
+ * @param field   Input: For grid dimensions and indexing.
+ */
+void apply_ic_preconditioner(Vector& z, const Vector& r, const StencilMatrix& L, const Field& field)
+{
+    const int nx = field.nx, ny = field.ny, nz = field.nz;
+    const int stride_i = ny * nz;
+    const int stride_j = nz;
+
+    // --- 1. Forward-substitution: L*y = r (storing y in z) ---
+    // Solves y[id] = (r[id] - L_w*y_w - L_s*y_s - L_b*y_b) / L_c
+    // This loop MUST be serial and in increasing order.
+    for (int i = 0; i < nx; ++i) {
+    for (int j = 0; j < ny; ++j) {
+    for (int k = 0; k < nz; ++k) {
+        
+        int id = field.idx(i, j, k);
+        double sum = r[id];
+
+        if (i > 0) sum -= L.A_w[id] * z[id - stride_i]; // z[w_idx] is y_w
+        if (j > 0) sum -= L.A_s[id] * z[id - stride_j]; // z[s_idx] is y_s
+        if (k > 0) sum -= L.A_b[id] * z[id - 1];       // z[b_idx] is y_b
+
+        z[id] = sum / L.A_c[id];
+    }}}
+    
+    // --- 2. Back-substitution: L^T*z = y (y is already in z) ---
+    // Solves z[id] = (y[id] - L_e*z_e - L_n*z_n - L_t*z_t) / L_c
+    // (where L_e = L.A_w of the eastern neighbor, etc.)
+    // This loop MUST be serial and in decreasing order.
+    for (int i = nx - 1; i >= 0; --i) {
+    for (int j = ny - 1; j >= 0; --j) {
+    for (int k = nz - 1; k >= 0; --k) {
+
+        int id = field.idx(i, j, k);
+        double sum = z[id]; // z[id] is y_i from the forward pass
+
+        if (i < nx-1) sum -= L.A_w[id + stride_i] * z[id + stride_i]; // L_w[east] * z_east
+        if (j < ny-1) sum -= L.A_s[id + stride_j] * z[id + stride_j]; // L_s[north] * z_north
+        if (k < nz-1) sum -= L.A_b[id + 1]       * z[id + 1];       // L_b[top] * z_top
+
+        z[id] = sum / L.A_c[id];
+    }}}
+}
+
+/**
+ * @brief (RUN ONCE) Computes the IC(0) factorization of matrix A.
+ *
+ * Calculates a sparse lower-triangular matrix L such that A ≈ L*L^T.
+ * The stencil of L has 4 diagonals: L_c, L_w, L_s, L_b.
+ * This function MUST be run serially.
+ *
+ * @param L       Output: The StencilMatrix to store L.
+ * @param A       Input: The positive-definite StencilMatrix A.
+ * @param field   Input: For grid dimensions and indexing.
+ */
+void build_ic_preconditioner(StencilMatrix& L, const StencilMatrix& A,
+                             const Field& field, const Mesh& m)
+{
+    const int nx = m.nx, ny = m.ny, nz = m.nz;
+    const int stride_i = ny * nz;
+    const int stride_j = nz;
+
+    const double small_val = 1e-30; // To prevent divide-by-zero
+
+    // Loop from (0,0,0) to (nx-1, ny-1, nz-1).
+    // This MUST be a serial loop. Do not add OpenMP.
+    for (int i = 0; i < nx; ++i) {
+    for (int j = 0; j < ny; ++j) {
+    for (int k = 0; k < nz; ++k) {
+
+        int id = field.idx(i, j, k);
+        double sum_sq = 0.0;
+
+        // --- 1. Calculate L_w, L_s, L_b (the off-diagonals) ---
+        
+        // West neighbor (L_w)
+        if (i > 0) {
+            int w_idx = id - stride_i;
+            double Lc_neighbor = L.A_c[w_idx];
+            if (std::abs(Lc_neighbor) > small_val) {
+                L.A_w[id] = A.A_w[id] / Lc_neighbor;
+                sum_sq += L.A_w[id] * L.A_w[id];
+            }
+        }
+        
+        // South neighbor (L_s)
+        if (j > 0) {
+            int s_idx = id - stride_j;
+            double Lc_neighbor = L.A_c[s_idx];
+            if (std::abs(Lc_neighbor) > small_val) {
+                L.A_s[id] = A.A_s[id] / Lc_neighbor;
+                sum_sq += L.A_s[id] * L.A_s[id];
+            }
+        }
+        
+        // Bottom neighbor (L_b)
+        if (k > 0) {
+            int b_idx = id - 1;
+            double Lc_neighbor = L.A_c[b_idx];
+            if (std::abs(Lc_neighbor) > small_val) {
+                L.A_b[id] = A.A_b[id] / Lc_neighbor;
+                sum_sq += L.A_b[id] * L.A_b[id];
+            }
+        }
+
+        // --- 2. Calculate L_c (the diagonal) ---
+        // L_c[id] = sqrt( A_c[id] - (L_w^2 + L_s^2 + L_b^2) )
+        double diag_val = A.A_c[id] - sum_sq;
+
+        // Robustness check: Ensure diagonal is positive
+        if (diag_val <= small_val) {
+            L.A_c[id] = 1.0; // Failsafe to prevent NAN/INF
+        } else {
+            L.A_c[id] = std::sqrt(diag_val);
+        }
+    }}}
 }
 
 /**
@@ -500,7 +620,7 @@ void build_stencil(StencilMatrix& A, const Field& field, const Mesh& m)
     const double A_s_base = -idy2;
     const double A_t_base = -idz2;
     const double A_b_base = -idz2;
-    const double A_c_base = +(A_e_base + A_w_base + A_n_base + A_s_base + A_t_base + A_b_base);
+    const double A_c_base = (2.0*idx2 + 2.0*idy2 + 2.0*idz2);
 
     // --- 2. Loop over all cells and set BCs ---
     #pragma omp parallel for
@@ -623,6 +743,215 @@ void fast_apply_laplacian(Vector& q, const Vector& p,
 
         q[id] = val;
     }}}
+}
+
+/**
+ * @brief Solves the linear system A*x = b using PCG with Chebyshev polynomial preconditioner.
+ *
+ * @param A           The pre-built StencilMatrix
+ * @param b           The right-hand-side vector (from build_b_vector)
+ * @param x           Input: Initial guess (field.p). Output: The solution.
+ * @param field       Const reference to the field (for fast_apply_laplacian)
+ * @param lambda_min  Estimated smallest eigenvalue of A
+ * @param lambda_max  Estimated largest eigenvalue of A
+ * @param poly_degree Degree of the Chebyshev polynomial
+ * @param max_iter    Max iterations
+ * @param tol         Convergence tolerance
+ * @return int        Number of iterations performed
+ */
+int solve_pressure_pcg_chebyshev(const StencilMatrix& A, const Vector& b, Vector& x,
+              const Field& field, double lambda_min, double lambda_max,
+               int poly_degree, int max_iter, double tol)
+{
+    const int n_nodes = field.nx * field.ny * field.nz;
+    
+    // 1. Allocate temporary vectors
+    Vector r(n_nodes); // Residual (r = b - A*x)
+    Vector z(n_nodes); // Preconditioned residual (z = M_inv * r)
+    Vector p(n_nodes); // Search direction
+    Vector q(n_nodes); // A * p
+
+    // 2. Initial calculation
+    // r = b - A*x
+    fast_apply_laplacian(q, x, A, field); // q = A*x
+    parallel_saxpy(r, 1.0, b, -1.0, q); // r = 1.0*b - 1.0*q
+
+    double initial_error = parallel_norm(r);
+    if (initial_error < tol) return 0; // Already converged
+
+    // z = M_inv * r (Chebyshev preconditioner, where M is diag(A))
+    apply_chebyshev_preconditioner(p, r, A, field, lambda_min, lambda_max, poly_degree); // NEW
+
+
+    // p = z
+    // parallel_copy(p, z);
+
+    // rho = r . z
+    double rho = parallel_dot(r, p);
+
+    // 3. Main PCG Iteration Loop
+    for (int k = 1; k <= max_iter; ++k)
+    {
+        // q = A * p
+        fast_apply_laplacian(q, p, A, field);
+
+        // alpha = rho / (p . q)
+        double alpha = rho / parallel_dot(p, q);
+
+        // x = x + alpha * p
+        parallel_axpy(x, alpha, p);
+
+        // r = r - alpha * q
+        parallel_axpy(r, -alpha, q);
+
+        // Check for convergence
+        double error = parallel_norm(r);
+        // std::cout << "PCG Iter: " << k << ", Error: " << error << std::endl;
+        if (error < tol) {
+            std::cout << "PCG converged in " << k << " iterations.\n";
+            return k;
+        }
+
+        // z = M_inv * r
+        apply_chebyshev_preconditioner(z, r, A, field, lambda_min, lambda_max, poly_degree); // NEW
+
+
+        // rho_new = r . z
+        double rho_new = parallel_dot(r, z);
+
+        // beta = rho_new / rho
+        double beta = rho_new / rho;
+
+        // p = z + beta * p
+        parallel_saxpy(p, 1.0, z, beta, p);
+
+        // rho = rho_new
+        rho = rho_new;
+    }
+
+    std::cerr << "Warning: PCG did not converge after " 
+              << max_iter << " iterations.\n";
+    return max_iter;
+}
+
+/**
+ * @brief (RUN IN PCG LOOP) Applies a Chebyshev polynomial preconditioner.
+ *
+ * Solves M*z = r, where M is an approximation of A.
+ * This is fully parallel.
+ *
+ * @param z           Output: The preconditioned vector.
+ * @param r           Input: The residual vector.
+ * @param A           Input: The StencilMatrix A.
+ * @param field       Input: For grid dimensions and indexing.
+ * @param lambda_min  Input: Estimated smallest eigenvalue.
+ * @param lambda_max  Input: Estimated largest eigenvalue.
+ * @param poly_degree Input: Degree of the polynomial (e.g., 3, 5, 7).
+ */
+void apply_chebyshev_preconditioner(Vector& z, const Vector& r,
+                                    const StencilMatrix& A, const Field& field,
+                                    double lambda_min, double lambda_max,
+                                    int poly_degree)
+{
+    const int n_nodes = field.nx * field.ny * field.nz;
+    
+    // Allocate temporary vectors
+    Vector p(n_nodes);
+    Vector res(n_nodes);
+
+    // --- 1. Calculate Chebyshev constants ---
+    const double d = (lambda_max + lambda_min) / 2.0;
+    const double c = (lambda_max - lambda_min) / 2.0;
+    
+    double alpha = 0.0;
+    double beta = 0.0;
+
+    // --- 2. Run Chebyshev Iteration ---
+    
+    // z_0 = 0 (initial guess for this preconditioner step)
+    #pragma omp parallel for
+    for (int i = 0; i < n_nodes; ++i) z[i] = 0.0;
+
+    // res_0 = r - A*z_0 = r
+    parallel_copy(res, r);
+    
+    // alpha_0 = 2 / d
+    alpha = 2.0 / d;
+    
+    // p_0 = res_0
+    parallel_copy(p, res);
+    
+    // z_1 = z_0 + alpha*p_0
+    parallel_axpy(z, alpha, p);
+    
+    // Loop for k=1 to m-1 (where m = poly_degree)
+    for (int k = 1; k < poly_degree; ++k)
+    {
+        // res_k = r - A*z_k
+        fast_apply_laplacian(res, z, A, field); // res = A*z_k
+        parallel_saxpy(res, 1.0, r, -1.0, res); // res = r - res
+        
+        // beta_k = (c * alpha_k-1 / 2.0)^2
+        beta = (c * alpha / 2.0) * (c * alpha / 2.0);
+        
+        // alpha_k = 1.0 / (d - beta_k)
+        alpha = 1.0 / (d - beta);
+        
+        // p_k = res_k + beta_k * p_k-1
+        parallel_saxpy(p, 1.0, res, beta, p);
+        
+        // z_k+1 = z_k + alpha_k * p_k
+        parallel_axpy(z, alpha, p);
+    }
+}
+
+/**
+ * @brief (RUN ONCE) Estimates the largest eigenvalue (lambda_max)
+ * of the matrix A using the parallel Power Iteration method.
+ *
+ * @param A       Input: The positive-definite StencilMatrix A.
+ * @param field   Input: For grid dimensions and indexing.
+ * @param n_iter  Input: Number of iterations (10-20 is usually enough).
+ * @return double The estimated largest eigenvalue.
+ */
+double estimate_lambda_max(const StencilMatrix& A, const Field& field, int n_iter)
+{
+    const int n_nodes = field.nx * field.ny * field.nz;
+    
+    // Create temporary vectors
+    Vector v(n_nodes);
+    Vector w(n_nodes);
+
+    // 1. Create a random starting vector
+    std::mt19937 gen(1337); // Mersenne Twister engine
+    std::uniform_real_distribution<> dis(-1.0, 1.0);
+    #pragma omp parallel for
+    for (int i = 0; i < n_nodes; ++i) {
+        v[i] = dis(gen);
+    }
+    parallel_copy(w, v); // Just to have w initialized
+    
+    double lambda_max = 0.0;
+    
+    // 2. Run Power Iteration
+    for (int k = 0; k < n_iter; ++k)
+    {
+        // w = A * v (The most expensive, parallel part)
+        fast_apply_laplacian(w, v, A, field);
+        
+        // lambda = v . w
+        lambda_max = parallel_dot(v, w);
+        
+        // v = w / ||w||
+        double norm = parallel_norm(w);
+        parallel_copy(v, w); // v = w
+        #pragma omp parallel for
+        for (int i = 0; i < n_nodes; ++i) {
+            v[i] /= norm;
+        }
+    }
+    
+    return lambda_max;
 }
 
 // (Place these in a utility header or at the top of your .cpp file)
