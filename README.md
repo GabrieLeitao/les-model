@@ -3,9 +3,10 @@
 Small 3D Large-Eddy Simulation (LES) prototype written in C++.
 Features:
 - 3D structured grid solver (u,v,w,p) with Smagorinsky SGS model
-- Explicit momentum update, pressure Poisson solver (Jacobi / SOR)
-- Restart/continue from VTK output files
-- OpenMP parallel loops
+- Explicit momentum update
+- Pressure Poisson solver (Jacobi, GS SOR, PCG with Jacobi, IC and Chebyshev preconditioners)
+- Restart/continue from previous step checkpoint in .data and .meta files
+- OpenMP parallelization
 
 Prerequisites
 - C++17-capable compiler (g++ recommended)
@@ -21,7 +22,7 @@ Run
 - Default run:
   - `make run` or `./bin/les_solver`
 - On start the program prompts:
-  - `c` to continue from latest `output/output_<N>.vtk` (if present)
+  - `c` to continue from latest `checkpoint/checkpoint.data` and `checkpoint/checkpoint.meta`(if present)
   - `r` to restart from scratch
 
 I/O
@@ -34,6 +35,7 @@ Project layout
 - src/ : source files
 - build/ : object files (created by Makefile)
 - bin/ : executable
+- checkpoint/ : checkpoint data from continuation of simulation supporting graceful termination `Ctrl + C`
 - output/ : VTK outputs (ignored by .gitignore)
 
 Makefile
@@ -41,12 +43,14 @@ Makefile
 - To change compiler flags edit `Makefile` variable `CXXFLAGS`.
 
 DONE:
-- Implemented graceful shutdown
-- Implemented correct checkpoint saving all Field with precision
-- Implemented IC(0) preconditioner for PCG for pressure laplacian solver
-- Implemented Chebyshev preconditioner for PCG for pressure laplacian solver
-- Implemented statistic for time-average flow after nsteps
+- Graceful shutdown
+- Correct checkpoint saving all Field with precision
+- IC(0) preconditioner for PCG for pressure laplacian solver
+- Chebyshev preconditioner for PCG for pressure laplacian solver
+- Statistic for time-average flow after nsteps
 
 TODO
 - Implement SOTA multigrid solver for Pressure
 - Semi-implicit methods for momentum: Convection Explicitly, Diffusion Implicitly
+- Conservative equation form
+- Continue to unorganized mesh and FVM

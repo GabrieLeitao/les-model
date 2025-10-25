@@ -50,7 +50,7 @@ int main()
     // Register signal handler for graceful termination
     signal(SIGINT, signal_handler);
 
-    const int size = 50;
+    const int size = 100;
     const double spacing = 0.01;
     Mesh  mesh{ size, size, size, spacing, spacing, spacing };
     Field field(mesh.nx, mesh.ny, mesh.nz);
@@ -84,7 +84,7 @@ int main()
     double nu     = 1.0e-5;
 
     double dt     = 1e-3;
-    int    nSteps = 2000;
+    int    nSteps = 5000;
     double time_simulated = 0.0;
 
 
@@ -130,11 +130,11 @@ int main()
 
         // Pressure solve
         // solve_pressure_jacobi(field, mesh, dt, rho);
-        solve_pressure_GS(field, mesh, dt, rho, 100);
-        // calculate_divergence(field.p_rhs, field, mesh, dt, rho);
-        // Vector b(n_nodes);
-        // build_b_vector(b, field.p_rhs, field, mesh);
-        // solve_pressure_pcg(A, b, field.p, field, 1000, 1e-6);
+        // solve_pressure_GS(field, mesh, dt, rho, 100);
+        calculate_divergence(field.p_rhs, field, mesh, dt, rho);
+        Vector b(n_nodes);
+        build_b_vector(b, field.p_rhs, field, mesh);
+        solve_pressure_pcg(A, b, field.p, field, 1000, 1e-6);
         // solve_pressure_pcg_chebyshev(A, b, field.p, field, lambda_min, lambda_max, 5, 1000, 1e-6);
 
         auto t4 = std::chrono::high_resolution_clock::now();
@@ -261,11 +261,36 @@ void define_obstacle_mask(Field &f, const Mesh &m)
 
     // --- Box near inlet ---
     int i_min_box = nx / 5;
-    int i_max_box = nx / 4.5;
+    int i_max_box = nx / 4;
     int j_min_box = ny * 2 / 5;
     int j_max_box = ny * 3 / 5;
     int k_min_box = nz * 2 / 5;
     int k_max_box = nz * 3 / 5;
+
+    #pragma omp parallel for
+    for (int i = 0; i < nx; ++i) {
+        const int i_base = i * stride_i;
+        for (int j = 0; j < ny; ++j) {
+            const int j_base = i_base + j * stride_j;
+            for (int k = 0; k < nz; ++k) {
+                const int id = j_base + k;
+
+                bool in_box =
+                    (i >= i_min_box && i < i_max_box &&
+                     j >= j_min_box && j < j_max_box &&
+                     k >= k_min_box && k < k_max_box);
+
+                if (in_box)
+                    f.is_solid[id] = true;
+            }
+        }
+    }
+    i_min_box = nx / 5 + nx/2;
+    i_max_box = nx / 4.5 + nx/2;
+    j_min_box = ny * 2 / 5;
+    j_max_box = ny * 3 / 5;
+    k_min_box = nz * 2 / 5;
+    k_max_box = nz * 4 / 5;
 
     #pragma omp parallel for
     for (int i = 0; i < nx; ++i) {

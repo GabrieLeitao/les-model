@@ -359,8 +359,8 @@ int solve_pressure_pcg(const StencilMatrix& A, const Vector& b, Vector& x,
     if (initial_error < tol) return 0; // Already converged
 
     // z = M_inv * r (Jacobi preconditioner, where M is diag(A))
-    apply_jacobi_preconditioner(p, r, A);
-    // apply_ic_preconditioner(p, r, A, field);
+    // apply_jacobi_preconditioner(p, r, A);
+    apply_ic_preconditioner(p, r, A, field);
 
     // p = z
     // parallel_copy(p, z);
@@ -387,13 +387,13 @@ int solve_pressure_pcg(const StencilMatrix& A, const Vector& b, Vector& x,
         double error = parallel_norm(r);
         // std::cout << "PCG Iter: " << k << ", Error: " << error << std::endl;
         if (error < tol) {
-            std::cout << "PCG converged in " << k << " iterations.\n";
+            // std::cout << "PCG converged in " << k << " iterations.\n";
             return k;
         }
 
         // z = M_inv * r
-        apply_jacobi_preconditioner(z, r, A);
-        // apply_ic_preconditioner(z, r, A, field);
+        // apply_jacobi_preconditioner(z, r, A);
+        apply_ic_preconditioner(z, r, A, field);
 
         // rho_new = r . z
         double rho_new = parallel_dot(r, z);
@@ -808,7 +808,7 @@ int solve_pressure_pcg_chebyshev(const StencilMatrix& A, const Vector& b, Vector
         double error = parallel_norm(r);
         // std::cout << "PCG Iter: " << k << ", Error: " << error << std::endl;
         if (error < tol) {
-            std::cout << "PCG converged in " << k << " iterations.\n";
+            // std::cout << "PCG converged in " << k << " iterations.\n";
             return k;
         }
 
